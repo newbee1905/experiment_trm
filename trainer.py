@@ -204,7 +204,7 @@ class Trainer:
 		- If World Size == 1: Uses AdamW for everything.
 		"""
 
-		body_params = list(self.model.block.parameters())
+		body_params = list(self.model.parameters())
 		body_param_ids = set(id(p) for p in body_params)
 		nonbody_params = [p for p in self.model.parameters() if id(p) not in body_param_ids]
 		
