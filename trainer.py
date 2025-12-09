@@ -456,7 +456,7 @@ if __name__ == "__main__":
 	train_loader = DataLoader(
 		train_dataset, 
 		batch_size=global_config.training.batch_size, 
-		shuffle=True, 
+		shuffle=shuffle, 
 		num_workers=10, 
 		sampler=sampler,
 		persistent_workers=True,
