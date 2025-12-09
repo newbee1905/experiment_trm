@@ -187,7 +187,10 @@ class SudokuACT(nn.Module):
 		self.config = config
 		
 		self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-		self.block = ReasoningBlock(config)
+
+		self.layers = nn.ModuleList([
+			ReasoningBlock(config) for _ in range(2)
+		])
 		
 		self.halting_linear = nn.Linear(config.hidden_size, 1)
 		
@@ -228,7 +231,9 @@ class SudokuACT(nn.Module):
 			
 			steps_taken += 1
 			
-			state = self.block(state)
+			for layer in self.layers:
+				state = layer(state)
+
 			p_halt = torch.sigmoid(self.halting_linear(state))
 			
 			# Mask logic for ACT

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import Dataset, DataLoader
 import os
 import math
@@ -23,7 +24,7 @@ from model import SudokuACT, ACTConfig
 load_dotenv()
 
 class SudokuDataset(Dataset):
-	def __init__(self, split="train", num_val_samples=10000, max_train_samples=None):
+	def __init__(self, split="train", num_val_samples=10_000, max_train_samples=100_000):
 		print(f"Loading Sudoku dataset (split={split})...")
 		full_ds = load_dataset("sapientinc/sudoku-extreme", split="train")
 
@@ -48,72 +49,63 @@ class SudokuDataset(Dataset):
 		return len(self.dataset)
 
 	def augment_sudoku(self, puzzle, solution):
-		"""
-		Applies Sudoku-preserving symmetries:
-		1. Permute digits (1-9).
-		2. Permute row bands (0-2, 3-5, 6-8).
-		3. Permute rows within bands.
-		4. Permute col bands.
-		5. Permute cols within bands.
-		6. Transpose.
-		"""
-		p = puzzle.numpy().reshape(9, 9)
-		s = solution.numpy().reshape(9, 9)
-		
-		# Digit Permutation (1-9 mapping)
-		perm = np.random.permutation(9) + 1
-		mapping = {i+1: perm[i] for i in range(9)}
-		mapping[0] = 0 # Empty cell stays empty
-		
-		# Create a lookup table: index 0 -> 0, index i -> mapping[i]
-		lookup = np.zeros(10, dtype=int)
-		for k, v in mapping.items():
-			lookup[k] = v
-		
-		p = lookup[p]
-		s = lookup[s]
-		
+		p = puzzle.view(9, 9)
+		s = solution.view(9, 9)
+
+		# Random mapping of digits 1-9
 		if random.random() < 0.5:
-			p = p.T
-			s = s.T
-			
-		# Permute Row Bands (chunks of 3 rows)
+			perm = torch.randperm(9) + 1
+			mapping = torch.zeros(10, dtype=torch.long)
+			mapping[1:] = perm
+			p = mapping[p]
+			s = mapping[s]
+
 		if random.random() < 0.5:
-			band_perm = np.random.permutation(3)
+			p = p.t()
+			s = s.t()
 
-			new_rows = []
-			for b in band_perm:
-				new_rows.extend(range(b*3, (b+1)*3))
-
-			p = p[new_rows, :]
-			s = s[new_rows, :]
-			
-		# Permute Rows within Bands
-		for b in range(3):
-			if random.random() < 0.5:
-				row_perm = np.random.permutation(3) + b*3
-				p[b*3:(b+1)*3, :] = p[row_perm, :]
-				s[b*3:(b+1)*3, :] = s[row_perm, :]
-		
-		# Permute Col Bands
+		# Permute Bands (Rows 0-2 vs 3-5 vs 6-8)
 		if random.random() < 0.5:
-			band_perm = np.random.permutation(3)
-			new_cols = []
+			band_perm = torch.randperm(3)
+			idx = torch.cat([torch.arange(b*3, (b+1)*3) for b in band_perm])
+			p = p[idx]
+			s = s[idx]
 
-			for b in band_perm:
-				new_cols.extend(range(b*3, (b+1)*3))
+		# Permute Rows WITHIN Bands 
+		if random.random() < 0.5:
+			p = p.view(3, 3, 9)
+			s = s.view(3, 3, 9)
 
-			p = p[:, new_cols]
-			s = s[:, new_cols]
+			# Generate 3 independent permutations for the rows
+			for b in range(3):
+				row_perm = torch.randperm(3)
+				p[b] = p[b][row_perm]
+				s[b] = s[b][row_perm]
+
+			p = p.view(9, 9)
+			s = s.view(9, 9)
+
+		# Permute Cols (similar to bands)
+		if random.random() < 0.5:
+			band_perm = torch.randperm(3)
+			idx = torch.cat([torch.arange(b*3, (b+1)*3) for b in band_perm])
+			p = p[:, idx]
+			s = s[:, idx]
+
+		# Permute Cols WITHIN Bands
+		if random.random() < 0.5:
+			p = p.view(9, 3, 3)
+			s = s.view(9, 3, 3)
+
+			for b in range(3):
+				col_perm = torch.randperm(3)
+				p[:, b] = p[:, b][:, col_perm]
+				s[:, b] = s[:, b][:, col_perm]
+
+			p = p.view(9, 9)
+			s = s.view(9, 9)
 			
-		# Permute Cols within Bands
-		for b in range(3):
-			if random.random() < 0.5:
-				col_perm = np.random.permutation(3) + b*3
-				p[:, b*3:(b+1)*3] = p[:, col_perm]
-				s[:, b*3:(b+1)*3] = s[:, col_perm]
-				
-		return torch.from_numpy(p.flatten()), torch.from_numpy(s.flatten())
+		return p.flatten(), s.flatten()
 	
 	def __getitem__(self, idx):
 		item = self.dataset[idx]
@@ -144,12 +136,14 @@ class TrainingConfig:
 		self.lr = 5e-4 
 		self.weight_decay = 0.01 
 		
-		self.batch_size = 192 
+		# self.batch_size = 192 
+		# self.gradient_accumulation_steps = 1
+		self.batch_size = 16
 		self.gradient_accumulation_steps = 1
 		
-		self.max_steps = 80000 
+		self.num_epochs = 60000
 		
-		self.save_every = 2000
+		self.save_every = 5000
 		self.grad_clip = 1.0 
 
 class GlobalConfig:
@@ -284,10 +278,15 @@ class Trainer:
 	def evaluate(self, loader):
 		if loader is None: return {}
 		self.model.eval()
+		
 		total_loss = 0.0
 		steps = 0
-		total_correct = 0
+		
 		total_cells = 0
+		correct_cells = 0
+		
+		total_puzzles = 0
+		correct_puzzles = 0
 		
 		max_val_batches = 100
 		
@@ -300,99 +299,126 @@ class Trainer:
 			inputs, targets = [b.to(self.device) for b in batch]
 			
 			logits, loss, _ = self.model(inputs, targets=targets)
-			
 			total_loss += loss.item()
 			
+			# shape: [batch_size, 81, vocab_size] -> [batch_size, 81]
 			preds = torch.argmax(logits, dim=-1)
 			
+			# Cell-wise Accuracy
 			mask = targets != -100
-			correct = (preds == targets) & mask
-			total_correct += correct.sum().item()
+			
+			# Compare only valid cells
+			cell_hits = (preds == targets) & mask
+			correct_cells += cell_hits.sum().item()
 			total_cells += mask.sum().item()
+			
+			# Exact Match Accuracy (Whole Puzzle)
+			row_hits = (preds == targets).all(dim=1)
+			correct_puzzles += row_hits.sum().item()
+			total_puzzles += inputs.size(0)
+			
 			steps += 1
 			
+		# Aggregate across GPUs
 		avg_loss = torch.tensor(total_loss / steps, device=self.device)
-		avg_loss = self._dist_mean(avg_loss)
-		
-		accuracy = total_correct / total_cells if total_cells > 0 else 0
+		total_cells_t = torch.tensor(total_cells, device=self.device)
+		correct_cells_t = torch.tensor(correct_cells, device=self.device)
+		total_puzzles_t = torch.tensor(total_puzzles, device=self.device)
+		correct_puzzles_t = torch.tensor(correct_puzzles, device=self.device)
+
+		if self.world_size > 1:
+			all_reduce(avg_loss, op=ReduceOp.SUM)
+			avg_loss /= self.world_size
+			
+			all_reduce(total_cells_t, op=ReduceOp.SUM)
+			all_reduce(correct_cells_t, op=ReduceOp.SUM)
+			all_reduce(total_puzzles_t, op=ReduceOp.SUM)
+			all_reduce(correct_puzzles_t, op=ReduceOp.SUM)
+
+		cell_acc = correct_cells_t.item() / total_cells_t.item() if total_cells_t.item() > 0 else 0
+		exact_acc = correct_puzzles_t.item() / total_puzzles_t.item() if total_puzzles_t.item() > 0 else 0
 		
 		self.model.train()
-		return {"loss": avg_loss.item(), "accuracy": accuracy}
+		return {
+			"loss": avg_loss.item(), 
+			"accuracy": cell_acc,	
+			"exact_accuracy": exact_acc,
+		}
 
 	def fit(self):
-		self.model.train()
-		step = 0
-		max_steps = self.config.training.max_steps
-		accum_steps = self.config.training.gradient_accumulation_steps
-		grad_clip = self.config.training.grad_clip
+		steps_per_epoch = len(self.train_loader) // self.config.training.gradient_accumulation_steps
+		total_steps = self.config.training.num_epochs * steps_per_epoch
 		
-		def cycle(loader):
-			while True:
-				for x in loader:
-					yield x
-		
-		data_iter = cycle(self.train_loader)
-		pbar = tqdm(range(max_steps), desc="Training", disable=self.global_rank != 0)
-		
-		current_loss = 0.0
-		avg_act_steps = 0.0
-		
-		while step < max_steps:
-			step_loss = 0.0
+		if self.global_rank == 0:
+			print(f"Training for {self.config.training.num_epochs} epochs.")
+			print(f"Total optimization steps: {total_steps}")
+			print(f"Steps per epoch: {steps_per_epoch}")
 
-			for _ in range(accum_steps):
-				inputs, targets = [b.to(self.device) for b in next(data_iter)]
-				
+		self.model.train()
+		global_step = 0
+		
+		epoch_pbar = tqdm(range(self.config.training.num_epochs), desc="Training", disable=self.global_rank != 0)
+		
+		for epoch in epoch_pbar:
+			if isinstance(self.train_loader.sampler, torch.utils.data.DistributedSampler):
+				self.train_loader.sampler.set_epoch(epoch)
+			
+			for batch_idx, batch in enumerate(self.train_loader):
+				inputs, targets = [b.to(self.device) for b in batch]
 				logits, loss, act_steps = self.model(inputs, targets=targets)
 				
-				loss = loss / accum_steps
+				loss = loss / self.config.training.gradient_accumulation_steps
 				loss.backward()
-				step_loss += loss.item()
-				if isinstance(act_steps, torch.Tensor):
-					avg_act_steps = act_steps.item()
-				else:
-					avg_act_steps = act_steps
-
-			# Gradient Clipping
-			if grad_clip > 0.0:
-				torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
 				
-			self.optimizer.step()
-			self.optimizer.zero_grad()
-			step += 1
-			current_loss = step_loss * accum_steps
-			
-			if step % 10 == 0:
-				pbar.set_postfix({
-					'loss': f"{current_loss:.4f}",
-					'steps': f"{avg_act_steps:.2f}"
-				})
+				current_act_steps = act_steps.item() if isinstance(act_steps, torch.Tensor) else act_steps
 
-				# Log to wandb
-				if self.global_rank == 0:
-					wandb.log({
-						"train/loss": current_loss,
-						"train/act_steps": avg_act_steps,
-						"train/step": step,
-						"train/lr": self.optimizer.param_groups[0]['lr']
-					})
-			
-			pbar.update(1)
+				if (batch_idx + 1) % self.config.training.gradient_accumulation_steps == 0:
+					if self.config.training.grad_clip > 0.0:
+						torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.grad_clip)
+					
+					self.optimizer.step()
+					self.optimizer.zero_grad()
+					global_step += 1
+					
+					current_loss = loss.item() * self.config.training.gradient_accumulation_steps
+					
+					if self.global_rank == 0:
+						epoch_pbar.set_postfix({
+							'step': global_step,
+							'loss': f"{current_loss:.4f}",
+							'act': f"{current_act_steps:.1f}"
+						})
 
-			if step % self.config.training.save_every == 0:
+						# Log to WandB every step (or every N steps if preferred)
+						wandb.log({
+							"train/loss": current_loss,
+							"train/act_steps": current_act_steps,
+							"train/global_step": global_step,
+							"train/epoch": epoch + (batch_idx / steps_per_epoch), # fractional epoch
+							"train/lr": self.optimizer.param_groups[0]['lr']
+						})
+
+			if (epoch + 1) % self.config.training.save_every == 0:
 				val_metrics = self.evaluate(self.val_loader)
+				
 				if self.global_rank == 0:
-					tqdm.write(f"\nStep {step} | Val Loss: {val_metrics.get('loss', 0):.4f} | Acc: {val_metrics.get('accuracy', 0):.4f}")
-
-					# Log validation metrics
+					tqdm.write(
+						f"Epoch {epoch+1} | "
+						f"Loss: {val_metrics.get('loss', 0):.4f} | "
+						f"Cell Acc: {val_metrics.get('accuracy', 0):.4f} | "
+						f"Exact Match: {val_metrics.get('exact_accuracy', 0):.4f}"
+					)
+					
 					wandb.log({
 						"val/loss": val_metrics.get('loss', 0),
 						"val/accuracy": val_metrics.get('accuracy', 0),
-						"val/step": step
+						"val/exact_accuracy": val_metrics.get('exact_accuracy', 0),
+						"val/epoch": epoch + 1
 					})
-				self.save_checkpoint(step, current_loss)
-		
-		pbar.close()
+					
+					self.save_checkpoint(epoch, val_metrics.get('loss', 0))
+
+		epoch_pbar.close()
 		if self.global_rank == 0:
 			wandb.finish()
 
@@ -405,23 +431,36 @@ if __name__ == "__main__":
 		act_ponder_penalty=0.01 
 	)
 	global_config = GlobalConfig()
+
+	is_ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
 	
 	# Data 
-	train_dataset = SudokuDataset(split="train", max_train_samples=100000) 
+	train_dataset = SudokuDataset(split="train", max_train_samples=100_000) 
 	val_dataset = SudokuDataset(split="val", num_val_samples=1000)
+
+	if is_ddp:
+		sampler = DistributedSampler(train_dataset)
+		shuffle = False 
+	else:
+		sampler = None
+		shuffle = True
 	
 	train_loader = DataLoader(
 		train_dataset, 
 		batch_size=global_config.training.batch_size, 
 		shuffle=True, 
-		num_workers=16, 
-		pin_memory=True
+		num_workers=10, 
+		sampler=sampler,
+		persistent_workers=True,
+		pin_memory=True,
 	)
+
 	val_loader = DataLoader(
 		val_dataset, 
 		batch_size=global_config.training.batch_size, 
 		shuffle=False, 
-		num_workers=16
+		num_workers=10,
+		pin_memory=True,
 	)
 	
 	# Model
