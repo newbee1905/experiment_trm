@@ -160,6 +160,10 @@ class GlobalConfig:
 class Trainer:
 	def __init__(self, model, config, train_loader, val_loader=None):
 		self.config = config
+
+		if not dist.is_initialized():
+			dist.init_process_group(backend="nccl")
+
 		self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
 		self.global_rank = int(os.environ.get("RANK", 0))
 		self.world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -429,4 +433,8 @@ if __name__ == "__main__":
 	
 	# Trainer
 	trainer = Trainer(model, global_config, train_loader, val_loader)
-	trainer.fit()
+	try:
+		trainer.fit()
+	finally:
+		if torch.distributed.is_initialized():
+			torch.distributed.destroy_process_group()
