@@ -427,6 +427,10 @@ class Trainer:
 			wandb.finish()
 
 if __name__ == "__main__":
+	if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+		dist.init_process_group(backend="nccl")
+		print(f"Initialized Process Group: Rank {dist.get_rank()} / {dist.get_world_size()}")
+
 	# Config matching TRM Paper
 	act_config = ACTConfig(
 		hidden_size=512, 
