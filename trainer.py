@@ -141,9 +141,9 @@ class TrainingConfig:
 		self.batch_size = 16
 		self.gradient_accumulation_steps = 1
 		
-		self.num_epochs = 60000
+		self.num_epochs = 1000
 		
-		self.save_every = 5000
+		self.save_every = 10 
 		self.grad_clip = 1.0 
 
 class GlobalConfig:
