@@ -204,9 +204,9 @@ class Trainer:
 		- If World Size == 1: Uses AdamW for everything.
 		"""
 
-		body_params = list(raw_model.block.parameters())
+		body_params = list(self.model.block.parameters())
 		body_param_ids = set(id(p) for p in body_params)
-		nonbody_params = [p for p in raw_model.parameters() if id(p) not in body_param_ids]
+		nonbody_params = [p for p in self.model.parameters() if id(p) not in body_param_ids]
 		
 		# Categorize based on dimensions for Muon compatibility and Weight Decay logic
 		# Muon targets >= 2D params inside the body
@@ -269,14 +269,12 @@ class Trainer:
 	def save_checkpoint(self, step, loss):
 		if self.global_rank != 0: return
 		
-		raw_model = self.model.module if isinstance(self.model, DDP) else self.model
-		
 		save_path = f"checkpoints/{self.config.experiment_name}"
 		os.makedirs(save_path, exist_ok=True)
 		
 		torch.save({
 			'step': step,
-			'model_state_dict': raw_model.state_dict(),
+			'model_state_dict': self.model.state_dict(),
 			'optimizer_state_dict': self.optimizer.state_dict(),
 			'loss': loss,
 		}, f"{save_path}/checkpoint_{step}.pt")
