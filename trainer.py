@@ -174,7 +174,6 @@ class Trainer:
 
 		# Configure optimizers
 		self.optimizer = self.configure_optimizers()
-		self.scaler = torch.cuda.amp.GradScaler(enabled=True)
 		
 		self.train_loader = train_loader
 		self.val_loader = val_loader
@@ -367,11 +366,10 @@ class Trainer:
 			for batch_idx, batch in enumerate(self.train_loader):
 				inputs, targets = [b.to(self.device) for b in batch]
 
-				with torch.autocast(device_type="cuda", dtype=torch.float16):
-					logits, loss, act_steps = self.model(inputs, targets=targets)
-					loss = loss / self.config.training.gradient_accumulation_steps
+				logits, loss, act_steps = self.model(inputs, targets=targets)
+				loss = loss / self.config.training.gradient_accumulation_steps
 
-				self.scaler.scale(loss).backward()
+				loss.backward()
 				
 				current_act_steps = act_steps.item() if isinstance(act_steps, torch.Tensor) else act_steps
 
@@ -379,8 +377,7 @@ class Trainer:
 					if self.config.training.grad_clip > 0.0:
 						torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.grad_clip)
 					
-					self.scaler.step(self.optimizer)
-					self.scaler.update()
+					self.optimizer.step()
 					self.optimizer.zero_grad()
 					global_step += 1
 					
